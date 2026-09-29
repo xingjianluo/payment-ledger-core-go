@@ -1,0 +1,205 @@
+package payment
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/xingjianluo/payment-ledger-core-go/internal/domain"
+	"github.com/xingjianluo/payment-ledger-core-go/internal/ledger"
+	"github.com/xingjianluo/payment-ledger-core-go/internal/storage"
+)
+
+type fixedClock struct{ t time.Time }
+
+func (c fixedClock) Now() time.Time { return c.t }
+
+func harness(t *testing.T) (*Service, *ledger.Service, *storage.Store) {
+	t.Helper()
+	st := storage.New()
+	clk := fixedClock{t: time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC)}
+	l := ledger.New(st, clk)
+	const CNY domain.Currency = "CNY"
+	if _, err := l.OpenAccount("wallet-cust", "customer-wallet", CNY, domain.AccountTypeLiability, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.OpenAccount("wallet-merch", "merchant-wallet", CNY, domain.AccountTypeLiability, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Deposit("wallet-cust", 100000, "deposit-cust"); err != nil {
+		t.Fatal(err)
+	}
+	return New(st, l, clk), l, st
+}
+
+func baseReq(key string) *domain.PaymentRequest {
+	return &domain.PaymentRequest{
+		IdempotencyKey: key,
+		PayerAccountID: "wallet-cust",
+		PayeeAccountID: "wallet-merch",
+		Amount:         2500,
+		Currency:       "CNY",
+		Reference:      "order-001",
+	}
+}
+
+func TestAcceptHappyPath(t *testing.T) {
+	svc, l, _ := harness(t)
+	res, err := svc.Accept(baseReq("key-happy"))
+	if err != nil {
+		t.Fatalf("受理失败: %v", err)
+	}
+	if res.Replayed {
+		t.Fatal("首次受理不应标记为重放")
+	}
+	t.Logf("幂等键 key-happy 受理成功: 支付号 %s 金额 %d 状态 %s 凭证 %s",
+		res.Payment.ID, res.Payment.Amount, res.Payment.Status, res.Payment.JournalID)
+
+	payer, _ := l.GetAccount("wallet-cust")
+	if payer.Balance != 97500 {
+		t.Fatalf("付款方余额期望 97500, 实际 %d", payer.Balance)
+	}
+	payable, _ := l.GetAccount(ledger.PayableAccountID("wallet-merch", "CNY"))
+	if payable.Balance != 2500 {
+		t.Fatalf("商户应付款期望 2500, 实际 %d", payable.Balance)
+	}
+}
+
+func TestIdempotentReplayNoDoubleCharge(t *testing.T) {
+	svc, l, _ := harness(t)
+	req := baseReq("key-replay")
+
+	r1, err := svc.Accept(req)
+	if err != nil {
+		t.Fatalf("首次受理失败: %v", err)
+	}
+	r2, err := svc.Accept(baseReq("key-replay"))
+	if err != nil {
+		t.Fatalf("相同内容重复提交应幂等通过: %v", err)
+	}
+	r3, err := svc.Accept(baseReq("key-replay"))
+	if err != nil {
+		t.Fatalf("第三次重复提交应幂等通过: %v", err)
+	}
+	if !r2.Replayed || !r3.Replayed {
+		t.Fatal("重复提交必须标记 Replayed=true")
+	}
+	if r1.Payment.ID != r2.Payment.ID || r2.Payment.ID != r3.Payment.ID {
+		t.Fatalf("重复提交必须返回同一支付号: %s/%s/%s", r1.Payment.ID, r2.Payment.ID, r3.Payment.ID)
+	}
+	payer, _ := l.GetAccount("wallet-cust")
+	if payer.Balance != 97500 {
+		t.Fatalf("重复提交不得重复扣款: 余额=%d 期望 97500", payer.Balance)
+	}
+	t.Logf("幂等键 key-replay 判定依据: 三次提交均返回支付号 %s，付款方余额保持 %d（仅扣一次 2500），Replayed=%v",
+		r2.Payment.ID, payer.Balance, r2.Replayed)
+}
+
+func TestIdempotencyKeyConflictDifferentContent(t *testing.T) {
+	svc, l, _ := harness(t)
+	if _, err := svc.Accept(baseReq("key-conflict")); err != nil {
+		t.Fatalf("首次受理失败: %v", err)
+	}
+
+	// 同一幂等键，金额不同。
+	diff := baseReq("key-conflict")
+	diff.Amount = 9999
+	_, err := svc.Accept(diff)
+	if !domain.IsErrorCode(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("同键不同内容必须返回 ErrIdempotencyConflict, 实际: %v", err)
+	}
+	t.Logf("幂等键 key-conflict 判定依据: 金额 2500 vs 9999 内容指纹不一致 => 拒绝（%v）", err)
+
+	// 付款方不同（使用一个真实但不同的账户）。
+	if _, err := l.OpenAccount("wallet-other", "other-wallet", "CNY", domain.AccountTypeLiability, false); err != nil {
+		t.Fatal(err)
+	}
+	diff2 := baseReq("key-conflict")
+	diff2.PayerAccountID = "wallet-other"
+	_, err = svc.Accept(diff2)
+	if !domain.IsErrorCode(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("同键不同付款方必须返回 ErrIdempotencyConflict, 实际: %v", err)
+	}
+	// 币种不同。
+	diff3 := baseReq("key-conflict")
+	diff3.Currency = "USD"
+	_, err = svc.Accept(diff3)
+	if !domain.IsErrorCode(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("同键不同币种必须返回 ErrIdempotencyConflict, 实际: %v", err)
+	}
+	t.Logf("幂等键 key-conflict 再次判定: 换付款方/换币种同样以内容指纹不一致拒绝")
+}
+
+func TestAcceptFailureReasonsDistinguishable(t *testing.T) {
+	svc, _, _ := harness(t)
+
+	cases := []struct {
+		name string
+		req  *domain.PaymentRequest
+		code domain.ErrorCode
+	}{
+		{"缺幂等键", &domain.PaymentRequest{PayerAccountID: "wallet-cust", PayeeAccountID: "wallet-merch", Amount: 1, Currency: "CNY"}, domain.ErrInvalid},
+		{"金额非正", func() *domain.PaymentRequest { r := baseReq("k1"); r.Amount = 0; return r }(), domain.ErrInvalid},
+		{"账户不存在", func() *domain.PaymentRequest { r := baseReq("k2"); r.PayeeAccountID = "nope"; return r }(), domain.ErrAccountNotFound}, {"币种不一致", func() *domain.PaymentRequest { r := baseReq("k3"); r.Currency = "USD"; return r }(), domain.ErrCurrencyMismatch},
+		{"余额不足", func() *domain.PaymentRequest { r := baseReq("k4"); r.Amount = 10_000_000; return r }(), domain.ErrInsufficientFunds},
+	}
+	for _, tc := range cases {
+		_, err := svc.Accept(tc.req)
+		if !domain.IsErrorCode(err, tc.code) {
+			t.Fatalf("%s: 期望错误码 %s, 实际 %v", tc.name, tc.code, err)
+		}
+		t.Logf("场景[%s] 判定依据: 返回错误码 %s（%v）", tc.name, tc.code, err)
+	}
+}
+
+func TestConcurrentSameIdempotencyKey(t *testing.T) {
+	svc, l, _ := harness(t)
+	const n = 20
+	var wg sync.WaitGroup
+	results := make(chan string, n)
+	conflicts := make(chan string, n)
+	wg.Add(n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			res, err := svc.Accept(baseReq("key-concurrent"))
+			if err != nil {
+				if domain.IsErrorCode(err, domain.ErrIdempotencyConflict) {
+					conflicts <- err.Error()
+					return
+				}
+				results <- "ERR:" + err.Error()
+				return
+			}
+			results <- res.Payment.ID
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(conflicts)
+
+	ids := map[string]int{}
+	for id := range results {
+		ids[id]++
+	}
+	cf := len(conflicts)
+	if len(ids) != 1 {
+		t.Fatalf("并发同键只应产生一个支付号, 实际: %v", ids)
+	}
+	var theID string
+	for id := range ids {
+		theID = id
+	}
+	if ids[theID]+cf != n {
+		t.Fatalf("成功(含幂等返回)+冲突拒绝数应等于并发数: %d+%d != %d", ids[theID], cf, n)
+	}
+	payer, _ := l.GetAccount("wallet-cust")
+	if payer.Balance != 97500 {
+		t.Fatalf("并发同键不得重复扣款: 余额=%d 期望 97500", payer.Balance)
+	}
+	t.Logf("幂等键 key-concurrent 判定依据: %d 个并发请求只产生支付号 %s（成功返回 %d，冲突 %d），付款方余额 %d 仅扣一次",
+		n, theID, ids[theID], cf, payer.Balance)
+}

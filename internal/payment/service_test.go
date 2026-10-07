@@ -203,3 +203,41 @@ func TestConcurrentSameIdempotencyKey(t *testing.T) {
 	t.Logf("幂等键 key-concurrent 判定依据: %d 个并发请求只产生支付号 %s（成功返回 %d，冲突 %d），付款方余额 %d 仅扣一次",
 		n, theID, ids[theID], cf, payer.Balance)
 }
+
+// 受理失败（余额不足）后：同键同内容重试结论稳定且原因明确；
+// 失败不占用幂等键——充值后同一键可正常走通，换新键同样可行。
+func TestAcceptFailureRetryStability(t *testing.T) {
+	svc, l, _ := harness(t)
+
+	// 余额 100000，受理 150000 必然余额不足。
+	bad := &domain.PaymentRequest{
+		IdempotencyKey: "key-nsf", PayerAccountID: "wallet-cust", PayeeAccountID: "wallet-merch",
+		Amount: 150000, Currency: "CNY", Reference: "too-big",
+	}
+	_, err1 := svc.Accept(bad)
+	_, err2 := svc.Accept(bad)
+	if !domain.IsErrorCode(err1, domain.ErrInsufficientFunds) || !domain.IsErrorCode(err2, domain.ErrInsufficientFunds) {
+		t.Fatalf("同键同内容失败重试结论必须稳定为余额不足: %v / %v", err1, err2)
+	}
+	t.Logf("失败重试稳定: 幂等键=key-nsf 两次均判定=INSUFFICIENT_FUNDS（键未被失败占用）")
+
+	// 失败未占键：充值后同一幂等键重新提交可正常受理。
+	if _, err := l.Deposit("wallet-cust", 100000, "deposit-topup"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := svc.Accept(bad)
+	if err != nil {
+		t.Fatalf("充值后同键重发应成功: %v", err)
+	}
+	t.Logf("充值后同键重发成功: 幂等键=key-nsf 支付号=%s", res.Payment.ID)
+
+	// 换新键发起另一笔，同样正常。
+	res2, err := svc.Accept(&domain.PaymentRequest{
+		IdempotencyKey: "key-nsf-new", PayerAccountID: "wallet-cust", PayeeAccountID: "wallet-merch",
+		Amount: 1000, Currency: "CNY", Reference: "fresh-key",
+	})
+	if err != nil {
+		t.Fatalf("换新幂等键发起应成功: %v", err)
+	}
+	t.Logf("换新键受理成功: 幂等键=key-nsf-new 支付号=%s", res2.Payment.ID)
+}

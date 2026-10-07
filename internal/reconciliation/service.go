@@ -39,6 +39,10 @@ func New(st *storage.Store, l *ledger.Service, clock Clock) *Service {
 //   - AMOUNT_MISMATCH      双方都有但金额不符（自动按差额挂暂记调整）；
 //   - DUPLICATE_RECORD     对账单中同 TxnID 重复出现（不自动调整，挂人工）。
 //
+// 退款记录：对账单中 TxnID 与内部退款号匹配的记录按退款核对（Subject=REFUND），
+// 与支付记录一样参与匹配/差异判定，不会被误判为内部缺失的"幽灵"记录；
+// 内部有、对账单没有的退款记 MISSING_IN_STATEMENT(REFUND)，挂人工核查。
+//
 // 幂等：同一批次重复执行直接返回首次结果，绝不产生重复调整凭证。
 func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.ReconciliationRun, error) {
 	if batchID == "" || source == nil {
@@ -69,6 +73,11 @@ func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.Rec
 		if err != nil {
 			return err
 		}
+		// 退款记录与支付一起纳入对账口径：按退款号与对账单 TxnID 匹配。
+		refunds, err := tx.ListRefundsByPayments(batch.PaymentIDs)
+		if err != nil {
+			return err
+		}
 
 		suspenseID, err := s.ledger.EnsureSuspenseInTx(tx, batch.Currency)
 		if err != nil {
@@ -80,11 +89,12 @@ func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.Rec
 		}
 
 		run := &domain.ReconciliationRun{
-			BatchID:        batchID,
-			Currency:       batch.Currency,
-			InternalCount:  len(payments),
-			StatementCount: len(records),
-			RanAt:          s.clock.Now(),
+			BatchID:             batchID,
+			Currency:            batch.Currency,
+			InternalCount:       len(payments),
+			InternalRefundCount: len(refunds),
+			StatementCount:      len(records),
+			RanAt:               s.clock.Now(),
 		}
 
 		// 对账单按 TxnID 聚合，识别重复记录。
@@ -106,13 +116,24 @@ func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.Rec
 		for _, p := range payments {
 			internal[p.ID] = p
 		}
+		internalRefund := map[string]*domain.Refund{}
+		for _, r := range refunds {
+			internalRefund[r.ID] = r
+		}
 
 		matched := 0
 		var diffs []domain.ReconciliationDifference
 
-		// 先扫对账单：处理内部缺失、重复、金额不符。
+		// 先扫对账单：处理内部缺失、重复、金额不符（支付与退款记录分别识别）。
 		for _, txnID := range stmtTxnOrder {
 			recs := stmtByTxn[txnID]
+			// 判定该记录的业务对象：支付号命中支付，退款号命中退款，否则按支付类幽灵记录处理。
+			subject := domain.SubjectPayment
+			if _, ok := internal[txnID]; !ok {
+				if _, ok := internalRefund[txnID]; ok {
+					subject = domain.SubjectRefund
+				}
+			}
 			// 第一条用于与内部账匹配；多出的条目记为重复（不自动调整）。
 			if len(recs) > 1 {
 				sort.SliceStable(recs, func(i, j int) bool { return recs[i].Amount < recs[j].Amount })
@@ -120,6 +141,7 @@ func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.Rec
 					r := recs[i]
 					diffs = append(diffs, domain.ReconciliationDifference{
 						Type:            domain.DiffDuplicate,
+						Subject:         subject,
 						TxnID:           txnID,
 						ExternalTxnID:   r.ExternalTxnID,
 						InternalAmount:  0,
@@ -130,6 +152,32 @@ func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.Rec
 				}
 			}
 			r := recs[0]
+			if subject == domain.SubjectRefund {
+				rf := internalRefund[txnID]
+				if rf.Amount != r.Amount {
+					delta := r.Amount.Sub(rf.Amount)
+					j, err := s.postMismatchAdjustment(tx, txnID, rf.Amount, r.Amount, suspenseID, suspenseRecvID, batch.Currency)
+					if err != nil {
+						return err
+					}
+					diffs = append(diffs, domain.ReconciliationDifference{
+						Type:            domain.DiffAmountMismatch,
+						Subject:         domain.SubjectRefund,
+						TxnID:           txnID,
+						ExternalTxnID:   r.ExternalTxnID,
+						InternalAmount:  rf.Amount,
+						StatementAmount: r.Amount,
+						Currency:        batch.Currency,
+						AutoAdjusted:    true,
+						JournalID:       j.ID,
+						Reason: fmt.Sprintf("退款 %s 金额不符：内部 %d，对账单 %d，差额 %d，已挂暂记调整",
+							txnID, rf.Amount, r.Amount, delta),
+					})
+					continue
+				}
+				matched++
+				continue
+			}
 			p, ok := internal[txnID]
 			if !ok {
 				// 对账单有、内部无：按对账单金额挂暂记应付调整。
@@ -139,6 +187,7 @@ func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.Rec
 				}
 				diffs = append(diffs, domain.ReconciliationDifference{
 					Type:            domain.DiffMissingInternal,
+					Subject:         domain.SubjectPayment,
 					TxnID:           txnID,
 					ExternalTxnID:   r.ExternalTxnID,
 					StatementAmount: r.Amount,
@@ -158,6 +207,7 @@ func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.Rec
 				}
 				diffs = append(diffs, domain.ReconciliationDifference{
 					Type:            domain.DiffAmountMismatch,
+					Subject:         domain.SubjectPayment,
 					TxnID:           txnID,
 					ExternalTxnID:   r.ExternalTxnID,
 					InternalAmount:  p.Amount,
@@ -173,7 +223,7 @@ func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.Rec
 			matched++
 		}
 
-		// 再扫内部：内部有、对账单完全没有的交易。
+		// 再扫内部：内部有、对账单完全没有的支付与退款。
 		var internalIDs []string
 		for id := range internal {
 			internalIDs = append(internalIDs, id)
@@ -186,11 +236,32 @@ func (s *Service) Reconcile(batchID string, source StatementSource) (*domain.Rec
 			p := internal[id]
 			diffs = append(diffs, domain.ReconciliationDifference{
 				Type:           domain.DiffMissingStatement,
+				Subject:        domain.SubjectPayment,
 				TxnID:          id,
 				InternalAmount: p.Amount,
 				Currency:       batch.Currency,
-				Reason: fmt.Sprintf("内部已结算交易 %s 金额 %d 在对账单中缺失，需人工核查",
+				Reason: fmt.Sprintf("内部已结算支付 %s 金额 %d 在对账单中缺失，需人工核查",
 					id, p.Amount),
+			})
+		}
+		var refundIDs []string
+		for id := range internalRefund {
+			refundIDs = append(refundIDs, id)
+		}
+		sort.Strings(refundIDs)
+		for _, id := range refundIDs {
+			if _, ok := stmtByTxn[id]; ok {
+				continue
+			}
+			rf := internalRefund[id]
+			diffs = append(diffs, domain.ReconciliationDifference{
+				Type:           domain.DiffMissingStatement,
+				Subject:        domain.SubjectRefund,
+				TxnID:          id,
+				InternalAmount: rf.Amount,
+				Currency:       batch.Currency,
+				Reason: fmt.Sprintf("内部已退款 %s（支付 %s）金额 %d 在对账单中缺失，需人工核查",
+					id, rf.PaymentID, rf.Amount),
 			})
 		}
 

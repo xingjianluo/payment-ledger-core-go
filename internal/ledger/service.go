@@ -21,6 +21,7 @@ const (
 	BizDeposit    = "INITIAL_DEPOSIT"
 	BizTransfer   = "TRANSFER"
 	BizPayment    = "PAYMENT"
+	BizRefund     = "REFUND"
 	BizSettlement = "SETTLEMENT"
 	BizFee        = "SETTLEMENT_FEE"
 	BizReconAdj   = "RECON_ADJUSTMENT"

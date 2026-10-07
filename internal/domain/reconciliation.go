@@ -4,6 +4,14 @@ import "time"
 
 type DifferenceType string
 
+// SubjectType 标识差异/记录针对的业务对象：支付或退款。
+type SubjectType string
+
+const (
+	SubjectPayment SubjectType = "PAYMENT"
+	SubjectRefund  SubjectType = "REFUND"
+)
+
 const (
 	DiffMissingStatement DifferenceType = "MISSING_IN_STATEMENT" // 内部有、对账单没有
 	DiffMissingInternal  DifferenceType = "MISSING_IN_INTERNAL"  // 对账单有、内部没有
@@ -21,6 +29,7 @@ type StatementRecord struct {
 
 type ReconciliationDifference struct {
 	Type            DifferenceType
+	Subject         SubjectType // PAYMENT / REFUND
 	TxnID           string
 	ExternalTxnID   string
 	InternalAmount  Money
@@ -32,11 +41,12 @@ type ReconciliationDifference struct {
 }
 
 type ReconciliationRun struct {
-	BatchID        string
-	Currency       Currency
-	InternalCount  int
-	StatementCount int
-	MatchedCount   int
-	Differences    []ReconciliationDifference
-	RanAt          time.Time
+	BatchID             string
+	Currency            Currency
+	InternalCount       int // 内部支付笔数
+	InternalRefundCount int // 内部退款笔数
+	StatementCount      int
+	MatchedCount        int
+	Differences         []ReconciliationDifference
+	RanAt               time.Time
 }

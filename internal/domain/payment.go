@@ -26,6 +26,8 @@ type Payment struct {
 	Amount            Money
 	Currency          Currency
 	Status            PaymentStatus
+	// RefundedAmount 已累计退款金额；可退余额 = Amount - RefundedAmount。
+	RefundedAmount    Money
 	Reference         string
 	JournalID         string
 	SettlementBatchID string

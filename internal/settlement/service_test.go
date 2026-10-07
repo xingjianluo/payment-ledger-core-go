@@ -7,6 +7,7 @@ import (
 	"github.com/xingjianluo/payment-ledger-core-go/internal/domain"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/ledger"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/payment"
+	"github.com/xingjianluo/payment-ledger-core-go/internal/refund"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/storage"
 )
 
@@ -183,4 +184,54 @@ func TestCreateBatchValidation(t *testing.T) {
 		t.Fatalf("重复打包应返回 ErrBatchSettled, 实际 %v", err)
 	}
 	t.Logf("批次 %s 重复打包判定: 支付已归属批次 => 拒绝（%v）", batch.ID, err)
+}
+
+// 批次内支付在结算前被全额退款：结算不再产生任何分录，支付仍随批次置为已结算；
+// 重复结算幂等，商户钱包分文不多。
+func TestSettleBatchFullyRefundedPayment(t *testing.T) {
+	e := setup(t)
+	refundSvc := refund.New(e.st, e.l, fixedClock{t: time.Now()})
+
+	// 只对 payments[0]（10000, w-c1 -> w-m1）建批，然后在结算前全额退掉。
+	batch, err := e.settle.CreateBatch(e.currency, []string{e.payments[0].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := refundSvc.Refund(&domain.RefundRequest{
+		IdempotencyKey: "stl-rfnd-full", PaymentID: e.payments[0].ID, Amount: 10000, Reason: "全额退",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("结算前全额退款: 幂等键=stl-rfnd-full 支付号=%s 批次=%s", e.payments[0].ID, batch.ID)
+
+	merchBefore, _ := e.l.GetAccount("w-m1")
+	sb, err := e.settle.SettleBatch(batch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.GrossAmount != 0 || sb.FeeTotal != 0 || sb.NetAmount != 0 {
+		t.Fatalf("全额退款后结算口径应全为 0: %+v", sb)
+	}
+	if sb.SettlementJournalID != "" || sb.FeeJournalID != "" {
+		t.Fatalf("全额退款后不应产生结算/手续费凭证: %+v", sb)
+	}
+	merchAfter, _ := e.l.GetAccount("w-m1")
+	if merchAfter.Balance != merchBefore.Balance {
+		t.Fatalf("商户钱包不得变动: %d -> %d", merchBefore.Balance, merchAfter.Balance)
+	}
+	p, _ := e.pay.Get(e.payments[0].ID)
+	if p.Status != domain.PaymentStatusSettled {
+		t.Fatalf("支付仍应随批次置为 SETTLED, 实际 %s", p.Status)
+	}
+	t.Logf("全额退款批次结算: 批次=%s 毛额=0 无凭证 支付状态=%s 判定依据=已退部分不再结给商户",
+		batch.ID, p.Status)
+
+	// 重复结算幂等。
+	if _, err := e.settle.SettleBatch(batch.ID); err != nil {
+		t.Fatal(err)
+	}
+	merchAgain, _ := e.l.GetAccount("w-m1")
+	if merchAgain.Balance != merchBefore.Balance {
+		t.Fatalf("重复结算不得动账: %d", merchAgain.Balance)
+	}
 }

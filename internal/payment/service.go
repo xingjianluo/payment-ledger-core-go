@@ -59,7 +59,7 @@ func (s *Service) Accept(req *domain.PaymentRequest) (*AcceptResult, error) {
 	if req.Currency == "" {
 		return nil, domain.NewError(domain.ErrInvalid, "币种不能为空")
 	}
-	fp := domain.FingerprintOf(req)
+	fp := domain.Fingerprint{Kind: domain.FingerprintKindPayment, Payment: domain.FingerprintOf(req)}
 
 	var result *AcceptResult
 	err := s.store.Update(func(tx *storage.Tx) error {
@@ -67,10 +67,10 @@ func (s *Service) Accept(req *domain.PaymentRequest) (*AcceptResult, error) {
 		if rec != nil {
 			if rec.Fingerprint != fp {
 				return domain.NewError(domain.ErrIdempotencyConflict,
-					"幂等键 %s 已用于不同内容的请求: 既有{付款=%s 收款=%s 金额=%d %s} 本次{付款=%s 收款=%s 金额=%d %s}",
-					req.IdempotencyKey,
-					rec.Fingerprint.PayerAccountID, rec.Fingerprint.PayeeAccountID, rec.Fingerprint.Amount, rec.Fingerprint.Currency,
-					fp.PayerAccountID, fp.PayeeAccountID, fp.Amount, fp.Currency)
+					"幂等键 %s 已用于不同内容的请求: 既有{%s 付款=%s 收款=%s 金额=%d %s} 本次{付款=%s 收款=%s 金额=%d %s}",
+					req.IdempotencyKey, rec.Fingerprint.Kind,
+					rec.Fingerprint.Payment.PayerAccountID, rec.Fingerprint.Payment.PayeeAccountID, rec.Fingerprint.Payment.Amount, rec.Fingerprint.Payment.Currency,
+					fp.Payment.PayerAccountID, fp.Payment.PayeeAccountID, fp.Payment.Amount, fp.Payment.Currency)
 			}
 			if rec.Status == domain.IdempotencyDone {
 				// 幂等命中：直接取首次结果，绝不重复过账。

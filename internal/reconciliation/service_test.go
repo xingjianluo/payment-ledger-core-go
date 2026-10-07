@@ -7,6 +7,7 @@ import (
 	"github.com/xingjianluo/payment-ledger-core-go/internal/domain"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/ledger"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/payment"
+	"github.com/xingjianluo/payment-ledger-core-go/internal/refund"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/settlement"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/storage"
 )
@@ -227,4 +228,94 @@ func TestReconcileRerunNoDuplicateAdjustment(t *testing.T) {
 	}
 	t.Logf("批次 %s 重复对账判定依据: 复用首次运行结果，调整凭证仍为 %s，暂记余额保持 %d、备付金余额保持 %d，无新增调整",
 		f.batch.ID, journalID, suspense2.Balance, float2.Balance)
+}
+
+// 退款记录参与对账：对账单中的退款记录按退款号匹配，不被误判为幽灵记录；
+// 对账单缺失的退款记 MISSING_IN_STATEMENT(REFUND)；重复执行对账幂等。
+func TestReconcileWithRefunds(t *testing.T) {
+	f := buildFixture(t)
+	refundSvc := refund.New(f.st, f.l, fixedClock{t: f.now})
+
+	// 对已结算支付 pays[0] 退 2000、对 pays[1] 退 5000。
+	r1, err := refundSvc.Refund(&domain.RefundRequest{
+		IdempotencyKey: "recon-rfnd-1", PaymentID: f.pays[0].ID, Amount: 2000, Reason: "售后",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := refundSvc.Refund(&domain.RefundRequest{
+		IdempotencyKey: "recon-rfnd-2", PaymentID: f.pays[1].ID, Amount: 5000, Reason: "售后",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("退款: 幂等键=recon-rfnd-1 退款号=%s 支付号=%s 金额=2000；幂等键=recon-rfnd-2 退款号=%s 支付号=%s 金额=5000",
+		r1.Refund.ID, f.pays[0].ID, r2.Refund.ID, f.pays[1].ID)
+
+	src := NewMemorySource()
+	// 三笔支付正常；r1 退款出现在对账单（应匹配）；r2 退款缺失（应记 REFUND 单边差异）。
+	src.Add(f.batch.ID,
+		stmtFor(f.pays[0], 10000), stmtFor(f.pays[1], 20000), stmtFor(f.pays[2], 30000),
+		domain.StatementRecord{ExternalTxnID: "EXT-" + r1.Refund.ID, TxnID: r1.Refund.ID, Amount: 2000, Currency: "CNY"},
+	)
+	run, err := f.recon.Reconcile(f.batch.ID, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("对账: 批次=%s 内部支付=%d 内部退款=%d 对账单=%d 匹配=%d 差异=%d",
+		f.batch.ID, run.InternalCount, run.InternalRefundCount, run.StatementCount, run.MatchedCount, len(run.Differences))
+	if run.InternalRefundCount != 2 {
+		t.Fatalf("内部退款笔数应为 2, 实际 %d", run.InternalRefundCount)
+	}
+	if run.MatchedCount != 4 { // 3 支付 + 1 退款
+		t.Fatalf("匹配数应为 4（3 支付 + 1 退款）, 实际 %d", run.MatchedCount)
+	}
+	if len(run.Differences) != 1 {
+		t.Fatalf("差异应只有 1 条（缺失的退款记录）, 实际 %+v", run.Differences)
+	}
+	d := run.Differences[0]
+	if d.Type != domain.DiffMissingStatement || d.Subject != domain.SubjectRefund || d.TxnID != r2.Refund.ID {
+		t.Fatalf("差异应为 MISSING_IN_STATEMENT/REFUND/%s, 实际 %+v", r2.Refund.ID, d)
+	}
+	t.Logf("差异识别: 退款号=%s 类型=%s 对象=%s 判定依据=内部有退款、对账单缺失", d.TxnID, d.Type, d.Subject)
+
+	// 重复执行：返回首次结果，不产生新调整凭证。
+	run2, err := f.recon.Reconcile(f.batch.ID, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(run2.Differences) != 1 || run2.Differences[0].JournalID != d.JournalID {
+		t.Fatalf("重复对账必须幂等: %+v", run2.Differences)
+	}
+	t.Logf("重复对账幂等: 批次=%s 差异数=%d 无新增调整凭证", f.batch.ID, len(run2.Differences))
+}
+
+// 对账单中的退款金额与内部不一致：按 REFUND 对象记金额差异并自动挂暂记。
+func TestReconcileRefundAmountMismatch(t *testing.T) {
+	f := buildFixture(t)
+	refundSvc := refund.New(f.st, f.l, fixedClock{t: f.now})
+	r1, err := refundSvc.Refund(&domain.RefundRequest{
+		IdempotencyKey: "recon-rfnd-mm", PaymentID: f.pays[0].ID, Amount: 2000, Reason: "售后",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := NewMemorySource()
+	src.Add(f.batch.ID,
+		stmtFor(f.pays[0], 10000), stmtFor(f.pays[1], 20000), stmtFor(f.pays[2], 30000),
+		domain.StatementRecord{ExternalTxnID: "EXT-" + r1.Refund.ID, TxnID: r1.Refund.ID, Amount: 2500, Currency: "CNY"},
+	)
+	run, err := f.recon.Reconcile(f.batch.ID, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(run.Differences) != 1 {
+		t.Fatalf("应有 1 条退款金额差异, 实际 %+v", run.Differences)
+	}
+	d := run.Differences[0]
+	if d.Type != domain.DiffAmountMismatch || d.Subject != domain.SubjectRefund || !d.AutoAdjusted || d.JournalID == "" {
+		t.Fatalf("退款金额差异应自动挂暂记: %+v", d)
+	}
+	t.Logf("退款金额不符: 退款号=%s 内部=2000 对账单=2500 判定=AMOUNT_MISMATCH/REFUND 调整凭证=%s",
+		d.TxnID, d.JournalID)
 }

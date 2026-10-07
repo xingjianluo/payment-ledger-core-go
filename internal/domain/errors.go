@@ -18,6 +18,8 @@ const (
 	ErrIdempotencyConflict ErrorCode = "IDEMPOTENCY_CONFLICT"
 	ErrPaymentNotFound     ErrorCode = "PAYMENT_NOT_FOUND"
 	ErrPaymentDuplicate    ErrorCode = "PAYMENT_DUPLICATE"
+	ErrRefundNotFound      ErrorCode = "REFUND_NOT_FOUND"
+	ErrRefundExceeds       ErrorCode = "REFUND_EXCEEDS_REMAINING"
 	ErrBatchNotFound       ErrorCode = "BATCH_NOT_FOUND"
 	ErrBatchSettled        ErrorCode = "BATCH_ALREADY_SETTLED"
 	ErrReconAlreadyRun     ErrorCode = "RECON_ALREADY_RUN"

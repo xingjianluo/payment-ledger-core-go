@@ -1,6 +1,7 @@
 package payment
 
 import (
+	"errors"
 	"time"
 
 	"github.com/xingjianluo/payment-ledger-core-go/internal/domain"
@@ -37,9 +38,12 @@ func New(st *storage.Store, l *ledger.Service, clock Clock) *Service {
 //     不重复扣款，Replayed=true；
 //   - 相同幂等键 + 不同内容：返回 ErrIdempotencyConflict，明确拒绝；
 //   - 相同幂等键并发到达：临界区内后到者看到 IN_FLIGHT 记录，返回 ErrIdempotencyConflict，
-//     调用方应稍后用相同请求重试，最终拿到幂等结果。
+//     调用方应稍后用相同请求重试，最终拿到幂等结果；
+//   - 首次因"说得清的原因"失败（账户不存在/币种不符/余额不足）：失败结论按幂等键落档，
+//     同键同内容重试返回同样的失败结论（原因稳定、不含糊），同键不同内容仍按冲突拒绝；
+//     换新的幂等键可正常重新发起。失败不落账、不动余额。
 //
-// 受理成功即时过账：借 付款方账户 / 贷 收款方账户（PAYMENT 凭证）。
+// 受理成功即时过账：借 付款方账户 / 贷 商户应付款（PAYMENT 凭证）。
 func (s *Service) Accept(req *domain.PaymentRequest) (*AcceptResult, error) {
 	if req == nil {
 		return nil, domain.NewError(domain.ErrInvalid, "支付请求不能为空")
@@ -62,17 +66,19 @@ func (s *Service) Accept(req *domain.PaymentRequest) (*AcceptResult, error) {
 	fp := domain.FingerprintOf(req)
 
 	var result *AcceptResult
+	var bizErr error
 	err := s.store.Update(func(tx *storage.Tx) error {
 		rec, _ := tx.GetIdempotency(req.IdempotencyKey)
 		if rec != nil {
-			if rec.Fingerprint != fp {
+			if rec.Kind != domain.IdempotencyKindPayment || rec.Fingerprint != fp {
 				return domain.NewError(domain.ErrIdempotencyConflict,
 					"幂等键 %s 已用于不同内容的请求: 既有{付款=%s 收款=%s 金额=%d %s} 本次{付款=%s 收款=%s 金额=%d %s}",
 					req.IdempotencyKey,
 					rec.Fingerprint.PayerAccountID, rec.Fingerprint.PayeeAccountID, rec.Fingerprint.Amount, rec.Fingerprint.Currency,
 					fp.PayerAccountID, fp.PayeeAccountID, fp.Amount, fp.Currency)
 			}
-			if rec.Status == domain.IdempotencyDone {
+			switch rec.Status {
+			case domain.IdempotencyDone:
 				// 幂等命中：直接取首次结果，绝不重复过账。
 				existing, err := tx.GetPayment(rec.ResultID)
 				if err != nil {
@@ -80,33 +86,57 @@ func (s *Service) Accept(req *domain.PaymentRequest) (*AcceptResult, error) {
 				}
 				result = &AcceptResult{Payment: existing, Replayed: true}
 				return nil
+			case domain.IdempotencyFailed:
+				// 失败结论稳定重放：与首次失败完全同因。
+				bizErr = &domain.LedgerError{Code: rec.FailureCode, Message: rec.FailureMessage}
+				return nil
+			default:
+				// IN_FLIGHT：同键并发的第二个请求。
+				return domain.NewError(domain.ErrIdempotencyConflict,
+					"幂等键 %s 正在处理中（并发重复提交），请稍后以相同请求重试", req.IdempotencyKey)
 			}
-			// IN_FLIGHT：同键并发的第二个请求。
-			return domain.NewError(domain.ErrIdempotencyConflict,
-				"幂等键 %s 正在处理中（并发重复提交），请稍后以相同请求重试", req.IdempotencyKey)
 		}
 
 		now := s.clock.Now()
 		inflight := &domain.IdempotencyRecord{
-			Key: req.IdempotencyKey, Fingerprint: fp,
+			Key: req.IdempotencyKey, Kind: domain.IdempotencyKindPayment, Fingerprint: fp,
 			Status: domain.IdempotencyInFlight, CreatedAt: now,
 		}
 		if err := tx.SaveIdempotency(inflight); err != nil {
 			return err
 		}
 
+		// fail 把"说得清原因"的业务失败按幂等键落档并提交（不落账、不动余额），
+		// 保证同键同内容重试得到同样的失败结论。
+		fail := func(err error) error {
+			var le *domain.LedgerError
+			if !errors.As(err, &le) {
+				return err // 非领域错误：整体回滚
+			}
+			if saveErr := tx.SaveIdempotency(&domain.IdempotencyRecord{
+				Key: req.IdempotencyKey, Kind: domain.IdempotencyKindPayment, Fingerprint: fp,
+				Status:      domain.IdempotencyFailed,
+				FailureCode: le.Code, FailureMessage: le.Message,
+				CreatedAt: now, ResolvedAt: &now,
+			}); saveErr != nil {
+				return saveErr
+			}
+			bizErr = le
+			return nil
+		}
+
 		// 同一临界区内过账：借 付款方钱包(负债减少) / 贷 商户应付款(负债增加，待结算)。
 		payer, err := tx.GetAccount(req.PayerAccountID)
 		if err != nil {
-			return err
+			return fail(err)
 		}
 		payee, err := tx.GetAccount(req.PayeeAccountID)
 		if err != nil {
-			return err
+			return fail(err)
 		}
 		if payer.Currency != req.Currency || payee.Currency != req.Currency {
-			return domain.NewError(domain.ErrCurrencyMismatch,
-				"币种不一致: 请求=%s 付款账户=%s 收款账户=%s", req.Currency, payer.Currency, payee.Currency)
+			return fail(domain.NewError(domain.ErrCurrencyMismatch,
+				"币种不一致: 请求=%s 付款账户=%s 收款账户=%s", req.Currency, payer.Currency, payee.Currency))
 		}
 		payableID, err := s.ledger.EnsurePayableInTx(tx, req.PayeeAccountID, req.Currency)
 		if err != nil {
@@ -119,7 +149,7 @@ func (s *Service) Accept(req *domain.PaymentRequest) (*AcceptResult, error) {
 		j, err := s.ledger.PostInTx(tx, ledger.BizPayment, "PAY:"+req.IdempotencyKey,
 			req.Currency, lines, "支付受理 "+req.Reference)
 		if err != nil {
-			return err
+			return fail(err)
 		}
 
 		p := &domain.Payment{
@@ -138,7 +168,7 @@ func (s *Service) Accept(req *domain.PaymentRequest) (*AcceptResult, error) {
 			return err
 		}
 		done := &domain.IdempotencyRecord{
-			Key: req.IdempotencyKey, Fingerprint: fp,
+			Key: req.IdempotencyKey, Kind: domain.IdempotencyKindPayment, Fingerprint: fp,
 			Status: domain.IdempotencyDone, ResultID: p.ID,
 			CreatedAt: now, ResolvedAt: &now,
 		}
@@ -150,6 +180,9 @@ func (s *Service) Accept(req *domain.PaymentRequest) (*AcceptResult, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	if bizErr != nil {
+		return nil, bizErr
 	}
 	return result, nil
 }

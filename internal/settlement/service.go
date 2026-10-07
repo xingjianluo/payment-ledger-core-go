@@ -92,11 +92,13 @@ func (s *Service) CreateBatch(currency domain.Currency, paymentIDs []string) (*d
 
 // SettleBatch 结算批次（幂等：已结算批次返回原批次，不重复过账）。
 //
+// 结算口径跟随退款：每笔支付实际结算额 = 支付金额 − 结算前已累计退款额，
+// 已退还给用户的钱不会再结给商户；手续费按实际结算额逐笔计提。
 // 在同一原子临界区内过两张复式凭证：
-//  1. SETTLEMENT：借 商户应付款(按商户汇总的总金额) / 贷 各商户钱包(总金额)；
+//  1. SETTLEMENT：借 商户应付款(按商户汇总的实际结算额) / 贷 各商户钱包；
 //  2. SETTLEMENT_FEE：借 各商户钱包(手续费) / 贷 手续费收入(手续费合计)。
 //
-// 完成后批次置 SETTLED，支付置 SETTLED；任何一步失败整体回滚。
+// 完成后批次置 SETTLED，支付置 SETTLED 并记录各自 SettledAmount；任何一步失败整体回滚。
 func (s *Service) SettleBatch(batchID string) (*domain.SettlementBatch, error) {
 	var out *domain.SettlementBatch
 	err := s.store.Update(func(tx *storage.Tx) error {
@@ -114,17 +116,18 @@ func (s *Service) SettleBatch(batchID string) (*domain.SettlementBatch, error) {
 			return err
 		}
 
-		// 按商户汇总。
+		// 按商户汇总（口径：支付金额 − 已退金额）。
 		grossByPayee := map[string]domain.Money{}
 		feeByPayee := map[string]domain.Money{}
 		payableByPayee := map[string]string{}
 		var order []string
-		var feeTotal domain.Money
+		var feeTotal, settledGross domain.Money
 		for _, p := range payments {
 			if p.Status != domain.PaymentStatusPendingSettlement {
 				return domain.NewError(domain.ErrBatchSettled,
 					"支付 %s 状态为 %s，批次不可结算", p.ID, p.Status)
 			}
+			settleAmt := p.Amount - p.RefundedAmount
 			if _, ok := grossByPayee[p.PayeeAccountID]; !ok {
 				order = append(order, p.PayeeAccountID)
 				payableID, err := s.ledger.EnsurePayableInTx(tx, p.PayeeAccountID, batch.Currency)
@@ -133,16 +136,21 @@ func (s *Service) SettleBatch(batchID string) (*domain.SettlementBatch, error) {
 				}
 				payableByPayee[p.PayeeAccountID] = payableID
 			}
-			grossByPayee[p.PayeeAccountID] = grossByPayee[p.PayeeAccountID].Add(p.Amount)
-			fee := s.fees.Fee(p.Amount)
+			grossByPayee[p.PayeeAccountID] = grossByPayee[p.PayeeAccountID].Add(settleAmt)
+			fee := s.fees.Fee(settleAmt)
 			feeByPayee[p.PayeeAccountID] = feeByPayee[p.PayeeAccountID].Add(fee)
 			feeTotal = feeTotal.Add(fee)
+			settledGross = settledGross.Add(settleAmt)
 		}
 		sort.Strings(order)
 
-		// 凭证1：待结算款结到商户钱包（总额过账）。
+		// 凭证1：待结算款结到商户钱包（按实际结算额过账；全额退款时可能整批为零，则跳过）。
+		var sjID string
 		var settleLines []domain.JournalLine
 		for _, payee := range order {
+			if grossByPayee[payee] == 0 {
+				continue
+			}
 			settleLines = append(settleLines, domain.JournalLine{
 				AccountID: payableByPayee[payee],
 				Debit:     grossByPayee[payee],
@@ -154,10 +162,13 @@ func (s *Service) SettleBatch(batchID string) (*domain.SettlementBatch, error) {
 				Note:      "结算入账",
 			})
 		}
-		sj, err := s.ledger.PostInTx(tx, ledger.BizSettlement, "SETTLE:"+batch.ID,
-			batch.Currency, settleLines, "批次结算 "+batch.ID)
-		if err != nil {
-			return err
+		if len(settleLines) > 0 {
+			sj, err := s.ledger.PostInTx(tx, ledger.BizSettlement, "SETTLE:"+batch.ID,
+				batch.Currency, settleLines, "批次结算 "+batch.ID)
+			if err != nil {
+				return err
+			}
+			sjID = sj.ID
 		}
 
 		// 凭证2：从商户钱包扣手续费，记手续费收入。
@@ -189,14 +200,18 @@ func (s *Service) SettleBatch(batchID string) (*domain.SettlementBatch, error) {
 
 		now := s.clock.Now()
 		batch.Status = domain.BatchStatusSettled
-		batch.SettlementJournalID = sj.ID
+		batch.SettlementJournalID = sjID
 		batch.FeeJournalID = fjID
+		batch.SettledGross = settledGross
+		batch.SettledFee = feeTotal
+		batch.SettledNet = settledGross.Sub(feeTotal)
 		batch.SettledAt = &now
 		if err := tx.SaveBatch(batch); err != nil {
 			return err
 		}
 		for _, p := range payments {
 			p.Status = domain.PaymentStatusSettled
+			p.SettledAmount = p.Amount - p.RefundedAmount
 			p.SettledAt = &now
 			if err := tx.SavePayment(p); err != nil {
 				return err

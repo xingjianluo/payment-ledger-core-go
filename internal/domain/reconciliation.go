@@ -37,6 +37,8 @@ type ReconciliationRun struct {
 	InternalCount  int
 	StatementCount int
 	MatchedCount   int
-	Differences    []ReconciliationDifference
-	RanAt          time.Time
+	// RefundCount 本批次支付关联的退款记录数（对账单中的退款记录按退款号识别）。
+	RefundCount int
+	Differences []ReconciliationDifference
+	RanAt       time.Time
 }

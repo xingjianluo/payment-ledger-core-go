@@ -11,6 +11,7 @@ import (
 	"github.com/xingjianluo/payment-ledger-core-go/internal/ledger"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/payment"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/reconciliation"
+	"github.com/xingjianluo/payment-ledger-core-go/internal/refund"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/settlement"
 	"github.com/xingjianluo/payment-ledger-core-go/internal/storage"
 )
@@ -27,6 +28,7 @@ func main() {
 	st := storage.New()
 	led := ledger.New(st, nil)
 	paySvc := payment.New(st, led, nil)
+	refundSvc := refund.New(st, led, nil)
 	settleSvc := settlement.New(st, led, domain.FeePolicy{BPS: 60}, nil) // 0.60%
 	reconSvc := reconciliation.New(st, led, nil)
 
@@ -114,7 +116,63 @@ func main() {
 	must(err)
 	fmt.Println("重复结算同一批次：幂等返回，未再扣费")
 
-	fmt.Println("========== 5. 对账（差异识别 + 自动调整 + 重复执行幂等） ==========")
+	fmt.Println("========== 5. 退款（批中退款 + 已结算退款 + 幂等） ==========")
+	// 新支付进批次但未结算时退一部分：已退部分不会再结给商户。
+	r5, err := paySvc.Accept(&domain.PaymentRequest{
+		IdempotencyKey: "IDEM-ORDER-1004", PayerAccountID: "cust-alice",
+		PayeeAccountID: "merch-shop", Amount: 5000, Currency: CNY, Reference: "订单1004",
+	})
+	must(err)
+	batch2, err := settleSvc.CreateBatch(CNY, []string{r5.Payment.ID})
+	must(err)
+	rf1, err := refundSvc.Refund(&domain.RefundRequest{
+		IdempotencyKey: "IDEM-REFUND-1004-A", PaymentID: r5.Payment.ID,
+		Amount: 2000, Currency: CNY, Reason: "部分退货",
+	})
+	must(err)
+	fmt.Printf("批次结算前部分退款：退款号=%s 金额 2000（从商户待结算款冲减）\n", rf1.Refund.ID)
+	sb2, err := settleSvc.SettleBatch(batch2.ID)
+	must(err)
+	fmt.Printf("批次 %s 结算：原毛额 5000，实际结算 %d（已退 2000 不再结给商户），手续费 %d\n",
+		batch2.ID, sb2.SettledGross, sb2.SettledFee)
+	// 已结算后再退：从商户钱包出账。
+	rf2, err := refundSvc.Refund(&domain.RefundRequest{
+		IdempotencyKey: "IDEM-REFUND-1004-B", PaymentID: r5.Payment.ID,
+		Amount: 500, Currency: CNY, Reason: "售后补偿",
+	})
+	must(err)
+	fmt.Printf("结算后退款：退款号=%s 金额 500（从商户钱包出账）\n", rf2.Refund.ID)
+	// 重复提交同一退款：幂等重放，不重复出账。
+	rf2again, err := refundSvc.Refund(&domain.RefundRequest{
+		IdempotencyKey: "IDEM-REFUND-1004-B", PaymentID: r5.Payment.ID,
+		Amount: 500, Currency: CNY, Reason: "售后补偿",
+	})
+	must(err)
+	fmt.Printf("重复提交同一退款：返回原退款号=%s, Replayed=%v（未重复出账）\n", rf2again.Refund.ID, rf2again.Replayed)
+	// 超额退款被明确拒绝。
+	p5, err := paySvc.Get(r5.Payment.ID)
+	must(err)
+	if _, err := refundSvc.Refund(&domain.RefundRequest{
+		IdempotencyKey: "IDEM-REFUND-1004-C", PaymentID: r5.Payment.ID,
+		Amount: p5.RemainingRefundable() + 1, Currency: CNY, Reason: "超额退款",
+	}); err != nil {
+		fmt.Printf("超额退款被明确拒绝（剩余可退 %d）: %v\n", p5.RemainingRefundable(), err)
+	}
+	// 退款后对账：对账单含净结算额与两条退款记录，全部识别匹配。
+	src2 := reconciliation.NewMemorySource()
+	src2.Add(batch2.ID,
+		domain.StatementRecord{ExternalTxnID: "EXT-1004", TxnID: r5.Payment.ID, Amount: 3000, Currency: CNY},
+		domain.StatementRecord{ExternalTxnID: "EXT-R1004A", TxnID: rf1.Refund.ID, Amount: 2000, Currency: CNY},
+		domain.StatementRecord{ExternalTxnID: "EXT-R1004B", TxnID: rf2.Refund.ID, Amount: 500, Currency: CNY},
+	)
+	run3, err := reconSvc.Reconcile(batch2.ID, src2)
+	must(err)
+	fmt.Printf("退款后对账：内部 %d 笔 + 退款 %d 条，对账单 %d 条全部匹配，差异 %d\n",
+		run3.InternalCount, run3.RefundCount, run3.StatementCount, len(run3.Differences))
+	printBalance(led, "cust-alice")
+	printBalance(led, "merch-shop")
+
+	fmt.Println("========== 6. 对账（差异识别 + 自动调整 + 重复执行幂等） ==========")
 	src := reconciliation.NewMemorySource()
 	// r1 对账单缺失；r3 金额不符(30500 -> 30000)；r4 正常；ghost 内部缺失；r4 再来一条重复。
 	src.Add(batch.ID,
@@ -138,7 +196,7 @@ func main() {
 	must(err)
 	fmt.Printf("重复执行对账：返回首次结果（差异 %d 条），不产生新的调整凭证\n", len(run2.Differences))
 
-	fmt.Println("========== 6. 试算平衡自检 ==========")
+	fmt.Println("========== 7. 试算平衡自检 ==========")
 	dr, cr, err := led.TrialBalance()
 	must(err)
 	for cur := range dr {

@@ -30,6 +30,10 @@ type SettlementBatch struct {
 	NetAmount           Money
 	SettlementJournalID string
 	FeeJournalID        string
-	CreatedAt           time.Time
-	SettledAt           *time.Time
+	// 结算时实际过账口径（建批后若发生退款，实际结算额 = 毛额 − 已退金额）。
+	SettledGross Money
+	SettledFee   Money
+	SettledNet   Money
+	CreatedAt    time.Time
+	SettledAt    *time.Time
 }

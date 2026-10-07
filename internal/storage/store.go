@@ -18,6 +18,8 @@ type Store struct {
 	journalByBiz   map[string]*domain.Journal
 	paymentsByID   map[string]*domain.Payment
 	paymentsByIDem map[string]*domain.Payment
+	refundsByID    map[string]*domain.Refund
+	refundsByIDem  map[string]*domain.Refund
 	idempotency    map[string]*domain.IdempotencyRecord
 	batches        map[string]*domain.SettlementBatch
 	reconByBatch   map[string]*domain.ReconciliationRun
@@ -30,21 +32,79 @@ func New() *Store {
 		journalByBiz:   map[string]*domain.Journal{},
 		paymentsByID:   map[string]*domain.Payment{},
 		paymentsByIDem: map[string]*domain.Payment{},
+		refundsByID:    map[string]*domain.Refund{},
+		refundsByIDem:  map[string]*domain.Refund{},
 		idempotency:    map[string]*domain.IdempotencyRecord{},
 		batches:        map[string]*domain.SettlementBatch{},
 		reconByBatch:   map[string]*domain.ReconciliationRun{},
 	}
 }
 
-// Update 在一个原子临界区内执行变更；fn 返回错误则本次所有改动被丢弃。
+// Update 在一个原子临界区内执行变更；fn 返回错误则本次所有改动被回滚丢弃。
+// 回滚通过对各 map 做浅快照实现：存储层保存的都是"先复制再写入"的不可变对象，
+// 没有任何代码原地修改已存对象，因此浅快照足以恢复到事务前状态。
 func (s *Store) Update(fn func(tx *Tx) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snap := s.snapshot()
 	tx := &Tx{s: s}
 	if err := fn(tx); err != nil {
+		s.restore(snap)
 		return err
 	}
 	return nil
+}
+
+type snapshot struct {
+	seq            uint64
+	accounts       map[string]*domain.Account
+	journalByID    map[string]*domain.Journal
+	journalByBiz   map[string]*domain.Journal
+	paymentsByID   map[string]*domain.Payment
+	paymentsByIDem map[string]*domain.Payment
+	refundsByID    map[string]*domain.Refund
+	refundsByIDem  map[string]*domain.Refund
+	idempotency    map[string]*domain.IdempotencyRecord
+	batches        map[string]*domain.SettlementBatch
+	reconByBatch   map[string]*domain.ReconciliationRun
+}
+
+func cloneMap[K comparable, V any](m map[K]V) map[K]V {
+	out := make(map[K]V, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func (s *Store) snapshot() snapshot {
+	return snapshot{
+		seq:            s.seq,
+		accounts:       cloneMap(s.accounts),
+		journalByID:    cloneMap(s.journalByID),
+		journalByBiz:   cloneMap(s.journalByBiz),
+		paymentsByID:   cloneMap(s.paymentsByID),
+		paymentsByIDem: cloneMap(s.paymentsByIDem),
+		refundsByID:    cloneMap(s.refundsByID),
+		refundsByIDem:  cloneMap(s.refundsByIDem),
+		idempotency:    cloneMap(s.idempotency),
+		batches:        cloneMap(s.batches),
+		reconByBatch:   cloneMap(s.reconByBatch),
+	}
+}
+
+func (s *Store) restore(snap snapshot) {
+	s.seq = snap.seq
+	s.accounts = snap.accounts
+	s.journalByID = snap.journalByID
+	s.journalByBiz = snap.journalByBiz
+	s.paymentsByID = snap.paymentsByID
+	s.paymentsByIDem = snap.paymentsByIDem
+	s.refundsByID = snap.refundsByID
+	s.refundsByIDem = snap.refundsByIDem
+	s.idempotency = snap.idempotency
+	s.batches = snap.batches
+	s.reconByBatch = snap.reconByBatch
 }
 
 // View 在一个读临界区内执行查询。
@@ -178,8 +238,43 @@ func (tx *Tx) ListPendingPayments(c domain.Currency) ([]*domain.Payment, error) 
 	return out, nil
 }
 
-// ---- idempotency ----
+// ---- refunds ----
 
+func (tx *Tx) SaveRefund(r *domain.Refund) error {
+	cp := *r
+	tx.s.refundsByID[r.ID] = &cp
+	if r.IdempotencyKey != "" {
+		tx.s.refundsByIDem[r.IdempotencyKey] = &cp
+	}
+	return nil
+}
+
+func (tx *Tx) GetRefund(id string) (*domain.Refund, error) {
+	r, ok := tx.s.refundsByID[id]
+	if !ok {
+		return nil, domain.NewError(domain.ErrRefundNotFound, "退款不存在: %s", id)
+	}
+	cp := *r
+	return &cp, nil
+}
+
+// ListRefundsByPaymentIDs 列出指定支付集合的全部退款（对账识别退款记录用）。
+func (tx *Tx) ListRefundsByPaymentIDs(paymentIDs []string) ([]*domain.Refund, error) {
+	set := map[string]bool{}
+	for _, id := range paymentIDs {
+		set[id] = true
+	}
+	var out []*domain.Refund
+	for _, r := range tx.s.refundsByID {
+		if set[r.PaymentID] {
+			cp := *r
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+
+// ---- idempotency ----
 func (tx *Tx) SaveIdempotency(r *domain.IdempotencyRecord) error {
 	cp := *r
 	tx.s.idempotency[r.Key] = &cp

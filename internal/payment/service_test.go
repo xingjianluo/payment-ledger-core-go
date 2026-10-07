@@ -203,3 +203,58 @@ func TestConcurrentSameIdempotencyKey(t *testing.T) {
 	t.Logf("幂等键 key-concurrent 判定依据: %d 个并发请求只产生支付号 %s（成功返回 %d，冲突 %d），付款方余额 %d 仅扣一次",
 		n, theID, ids[theID], cf, payer.Balance)
 }
+
+// 失败后的重试稳定性：因"说得清的原因"失败的受理，同键同内容重试结论稳定且原因一致；
+// 同键不同内容明确拒绝；换新幂等键可正常走通；失败不落账。
+func TestAcceptFailureRetryStability(t *testing.T) {
+	svc, l, _ := harness(t)
+
+	// 余额不足失败：钱包只有 100000。
+	bad := baseReq("key-nsf")
+	bad.Amount = 10_000_000
+	_, err1 := svc.Accept(bad)
+	if !domain.IsErrorCode(err1, domain.ErrInsufficientFunds) {
+		t.Fatalf("首次应失败为 ErrInsufficientFunds, 实际: %v", err1)
+	}
+	// 同键同内容重试：同样的错误码与同样的原因说明（不是含糊的"处理中"冲突）。
+	_, err2 := svc.Accept(bad)
+	if !domain.IsErrorCode(err2, domain.ErrInsufficientFunds) {
+		t.Fatalf("同键同内容重试必须稳定返回 ErrInsufficientFunds, 实际: %v", err2)
+	}
+	if err1.Error() != err2.Error() {
+		t.Fatalf("同键同内容重试结论必须一致:\n首次: %v\n重试: %v", err1, err2)
+	}
+	t.Logf("幂等键 key-nsf 判定依据: 两次提交均稳定返回 INSUFFICIENT_FUNDS（%v），标识未被永久占住为含糊冲突", err2)
+
+	// 同键不同内容：明确拒绝。
+	diff := baseReq("key-nsf")
+	diff.Amount = 100
+	if _, err := svc.Accept(diff); !domain.IsErrorCode(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("同键不同内容必须返回 ErrIdempotencyConflict, 实际: %v", err)
+	}
+	// 换新幂等键（内容相同）：正常走通。
+	ok, err := svc.Accept(baseReq("key-nsf-new"))
+	if err != nil {
+		t.Fatalf("换新幂等键应正常受理: %v", err)
+	}
+	t.Logf("幂等键 key-nsf-new 判定依据: 换键后受理成功，支付号 %s", ok.Payment.ID)
+
+	// 账户不存在失败同样稳定。
+	noAcc := baseReq("key-noacc")
+	noAcc.PayeeAccountID = "nope"
+	_, e1 := svc.Accept(noAcc)
+	_, e2 := svc.Accept(noAcc)
+	if !domain.IsErrorCode(e1, domain.ErrAccountNotFound) || !domain.IsErrorCode(e2, domain.ErrAccountNotFound) {
+		t.Fatalf("账户不存在必须稳定返回 ErrAccountNotFound: %v / %v", e1, e2)
+	}
+	if e1.Error() != e2.Error() {
+		t.Fatalf("账户不存在重试结论必须一致: %v / %v", e1, e2)
+	}
+	t.Logf("幂等键 key-noacc 判定依据: 两次提交均稳定返回 ACCOUNT_NOT_FOUND（%v）", e2)
+
+	// 失败不落账：只成功了一笔 2500。
+	payer, _ := l.GetAccount("wallet-cust")
+	if payer.Balance != 97500 {
+		t.Fatalf("失败受理不得动账: 余额=%d 期望 97500", payer.Balance)
+	}
+}
